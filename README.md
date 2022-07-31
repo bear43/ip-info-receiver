@@ -1,0 +1,1 @@
+Spring webflux firstly then kafka and kinda nosql
