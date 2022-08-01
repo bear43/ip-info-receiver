@@ -23,8 +23,8 @@ public class RequestController {
     RequestService requestService;
 
     @GetMapping("/all")
-    public Flux<PageResponse<RequestDto>> getAll(RequestFilter filter) {
-        return Flux.empty();
+    public Mono<PageResponse<RequestDto>> getAll(RequestFilter filter) {
+        return requestService.filter(filter);
     }
 
     @GetMapping("/by-ip/{ip}")
