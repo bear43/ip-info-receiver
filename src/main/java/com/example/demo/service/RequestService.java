@@ -9,17 +9,23 @@ import io.swagger.v3.oas.annotations.servers.Server;
 import lombok.AccessLevel;
 import lombok.RequiredArgsConstructor;
 import lombok.experimental.FieldDefaults;
+import org.reactivestreams.Publisher;
+import org.springframework.data.r2dbc.core.R2dbcEntityTemplate;
+import org.springframework.data.relational.core.query.Query;
+import org.springframework.data.util.Pair;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.r2dbc.core.FetchSpec;
+import org.springframework.r2dbc.core.PreparedOperation;
+import org.springframework.r2dbc.core.QueryOperation;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.util.function.Tuples;
 
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.UUID;
+import java.io.Serializable;
+import java.util.*;
+import java.util.stream.Collector;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -28,6 +34,8 @@ public class RequestService {
 
     RequestRepository requestRepository;
     DatabaseClient databaseClient;
+
+    R2dbcEntityTemplate r2dbcEntityTemplate;
 
     public Mono<UUID> create(RequestDto request) {
         return Mono.just(new Request())
@@ -50,10 +58,10 @@ public class RequestService {
 
     public Mono<PageResponse<RequestDto>> filter(RequestFilter filter) {
         return Mono.just(
-                new StringBuilder()
-                        .append(" from request r\n")
-                        .append("where 1=1\n")
-        )
+                        new StringBuilder()
+                                .append(" from request r\n")
+                                .append("where 1=1\n")
+                )
                 .map(sb -> {
                     if (filter.getId() != null) {
                         sb.append("and r.id = :id\n");
@@ -75,27 +83,44 @@ public class RequestService {
                 })
                 .map(tuple -> Tuples.of(tuple.getT1().toString(), tuple.getT2().toString()))
                 .map(tuple -> Tuples.of(databaseClient.sql(tuple.getT1()), databaseClient.sql(tuple.getT2())))
-                .map(tuple -> {
-                    DatabaseClient.GenericExecuteSpec baseSpec = tuple.getT1();
-                    DatabaseClient.GenericExecuteSpec pageSpec = tuple.getT2();
-                    if (filter.getId() != null) {
-                        baseSpec = baseSpec.bind("id", filter.getId());
-                        pageSpec = pageSpec.bind("id", filter.getId());
-                    }
-                    if (filter.getIp() != null) {
-                        baseSpec = baseSpec.bind("ip", filter.getIp());
-                        pageSpec = pageSpec.bind("ip", filter.getIp());
-                    }
-                    Integer limit = filter.getLimit();
-                    Integer page = filter.getPage();
-                    baseSpec = baseSpec.bind("limit", limit);
-                    baseSpec = baseSpec.bind("offset", (page - 1) * limit);
-                    return Tuples.of(baseSpec.fetch(), pageSpec.fetch());
-                })
+                .flatMap(tuple -> Flux.just(
+                                        Pair.of("id", Optional.ofNullable(filter.getId())),
+                                        Pair.of("ip", Optional.ofNullable(filter.getIp())),
+                                        Pair.of("limit", Optional.ofNullable(filter.getLimit())),
+                                        Pair.of(
+                                                "offset",
+                                                Optional.of(
+                                                        (Optional.ofNullable(filter.getPage()).orElse(1) - 1) *
+                                                                Optional.ofNullable(filter.getLimit()).orElse(0)
+                                                )
+                                        )
+                                )
+                        .filter(param -> param.getSecond().isPresent())
+                        .map(param -> Pair.of(param.getFirst(), param.getSecond().get()))
+                        .collectList()
+                        .map(params -> {
+                                    DatabaseClient.GenericExecuteSpec baseSpec = tuple.getT1();
+                                    for (Pair<String, ? extends Serializable> param : params) {
+                                        baseSpec = baseSpec.bind(param.getFirst(), param.getSecond());
+                                    }
+
+                                    DatabaseClient.GenericExecuteSpec pageSpec = tuple.getT2();
+                                    List<Pair<String, ? extends Serializable>> paginationParams = params.stream()
+                                            .filter(param ->
+                                                    !(param.getFirst().equals("limit") ||
+                                                            param.getFirst().equals("offset"))
+                                            ).collect(Collectors.toList());
+
+                                    for (Pair<String, ? extends Serializable> param : paginationParams) {
+                                        pageSpec = pageSpec.bind(param.getFirst(), param.getSecond());
+                                    }
+                                    return Tuples.of(baseSpec.fetch(), pageSpec.fetch());
+                                })
+                )
                 .flatMap(tuple -> {
                     Flux<RequestDto> result = tuple.getT1()
-                                    .all()
-                                    .map(this::fromFetchSpecToDto);
+                            .all()
+                            .map(this::fromFetchSpecToDto);
                     Mono<Long> cnt = tuple.getT2()
                             .one()
                             .map(map -> (Long) map.get("cnt"));
