@@ -118,19 +118,24 @@ public class RequestService {
                                 })
                 )
                 .flatMap(tuple -> {
-                    Flux<RequestDto> result = tuple.getT1()
+                    Mono<List<RequestDto>> result = tuple.getT1()
                             .all()
-                            .map(this::fromFetchSpecToDto);
+                            .map(this::fromFetchSpecToDto)
+                            .collectList();
+
                     Mono<Long> cnt = tuple.getT2()
                             .one()
                             .map(map -> (Long) map.get("cnt"));
-                    return result.collectList()
-                            .map(l -> new PageResponse<RequestDto>().setData(l)
-                                    .setPage(filter.getPage())
-                                    .setLimit(filter.getLimit())
-                            )
+
+                    return result.map(l -> getRequestDtoPageResponse(filter, l))
                             .zipWith(cnt, PageResponse::setTotal);
                 });
+    }
+
+    private static PageResponse<RequestDto> getRequestDtoPageResponse(RequestFilter filter, List<RequestDto> l) {
+        return new PageResponse<RequestDto>().setData(l)
+                .setPage(filter.getPage())
+                .setLimit(filter.getLimit());
     }
 
     private RequestDto fromFetchSpecToDto(Map<String, Object> map) {
