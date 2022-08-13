@@ -5,18 +5,17 @@ import com.example.demo.dto.RequestDto;
 import com.example.demo.dto.base.PageResponse;
 import com.example.demo.entity.Request;
 import com.example.demo.filter.RequestFilter;
-import io.swagger.v3.oas.annotations.servers.Server;
+import com.example.demo.util.StringBuilderUtil;
+import com.example.demo.util.sql.BinderUtil;
+import com.example.demo.util.sql.PaginationUtil;
 import lombok.AccessLevel;
 import lombok.RequiredArgsConstructor;
 import lombok.experimental.FieldDefaults;
-import org.reactivestreams.Publisher;
 import org.springframework.data.r2dbc.core.R2dbcEntityTemplate;
-import org.springframework.data.relational.core.query.Query;
 import org.springframework.data.util.Pair;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.r2dbc.core.FetchSpec;
-import org.springframework.r2dbc.core.PreparedOperation;
-import org.springframework.r2dbc.core.QueryOperation;
+import org.springframework.r2dbc.core.RowsFetchSpec;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -24,7 +23,6 @@ import reactor.util.function.Tuples;
 
 import java.io.Serializable;
 import java.util.*;
-import java.util.stream.Collector;
 import java.util.stream.Collectors;
 
 @Service
@@ -34,8 +32,6 @@ public class RequestService {
 
     RequestRepository requestRepository;
     DatabaseClient databaseClient;
-
-    R2dbcEntityTemplate r2dbcEntityTemplate;
 
     public Mono<UUID> create(RequestDto request) {
         return Mono.just(new Request())
@@ -57,79 +53,42 @@ public class RequestService {
     }
 
     public Mono<PageResponse<RequestDto>> filter(RequestFilter filter) {
-        return Mono.just(
-                        new StringBuilder()
-                                .append(" from request r\n")
-                                .append("where 1=1\n")
-                )
-                .map(sb -> {
-                    if (filter.getId() != null) {
-                        sb.append("and r.id = :id\n");
-                    }
-                    if (filter.getIp() != null) {
-                        sb.append("and r.ip like '%' || :ip || '%'\n");
-                    }
-                    return sb;
-                })
-                .zipWith(Mono.just(new StringBuilder()), (baseSql, sb) -> {
-                    sb.append(baseSql)
-                            .insert(0, "select count(1) as cnt");
+        return Mono.just(getSql("select *", filter))
+                .map(PaginationUtil::applyPagination)
+                .flatMap(sb -> generateSqlAndApplyBindings(sb, filter))
+                .map(spec -> PaginationUtil.applyBindings(spec, filter))
+                .map(DatabaseClient.GenericExecuteSpec::fetch)
+                .flux()
+                .flatMap(RowsFetchSpec::all)
+                .map(this::fromFetchSpecToDto)
+                .collectList()
+                .map(l -> getRequestDtoPageResponse(filter, l))
+                .zipWith(getCount(filter), PageResponse::setTotal);
+    }
 
-                    baseSql.insert(0, "select *")
-                            .append("limit :limit\n")
-                            .append("offset :offset\n");
+    private StringBuilder getSql(String select, RequestFilter filter) {
+        StringBuilder sb = new StringBuilder()
+                .append(select)
+                .append(" from request r\n")
+                .append("where 1=1\n");
+        StringBuilderUtil.ifNotNullThenAppend(sb, filter::getId, "and r.id = :id\n");
+        StringBuilderUtil.ifNotBlankThenAppend(sb, filter::getIp, "and r.ip like '%' || :ip || '%'\n");
+        return sb;
+    }
 
-                    return Tuples.of(baseSql, sb);
-                })
-                .map(tuple -> Tuples.of(tuple.getT1().toString(), tuple.getT2().toString()))
-                .map(tuple -> Tuples.of(databaseClient.sql(tuple.getT1()), databaseClient.sql(tuple.getT2())))
-                .flatMap(tuple -> Flux.just(
-                                        Pair.of("id", Optional.ofNullable(filter.getId())),
-                                        Pair.of("ip", Optional.ofNullable(filter.getIp())),
-                                        Pair.of("limit", Optional.ofNullable(filter.getLimit())),
-                                        Pair.of(
-                                                "offset",
-                                                Optional.of(
-                                                        (Optional.ofNullable(filter.getPage()).orElse(1) - 1) *
-                                                                Optional.ofNullable(filter.getLimit()).orElse(0)
-                                                )
-                                        )
-                                )
-                        .filter(param -> param.getSecond().isPresent())
-                        .map(param -> Pair.of(param.getFirst(), param.getSecond().get()))
-                        .collectList()
-                        .map(params -> {
-                                    DatabaseClient.GenericExecuteSpec baseSpec = tuple.getT1();
-                                    for (Pair<String, ? extends Serializable> param : params) {
-                                        baseSpec = baseSpec.bind(param.getFirst(), param.getSecond());
-                                    }
+    private Mono<DatabaseClient.GenericExecuteSpec> generateSqlAndApplyBindings(StringBuilder sb, RequestFilter filter) {
+        return Mono.just(sb.toString())
+                .map(databaseClient::sql)
+                .map(spec -> BinderUtil.ifNotNullThen(spec, "id", filter::getId))
+                .map(spec -> BinderUtil.ifNotNullThen(spec, "ip", filter::getIp));
+    }
 
-                                    DatabaseClient.GenericExecuteSpec pageSpec = tuple.getT2();
-                                    List<Pair<String, ? extends Serializable>> paginationParams = params.stream()
-                                            .filter(param ->
-                                                    !(param.getFirst().equals("limit") ||
-                                                            param.getFirst().equals("offset"))
-                                            ).collect(Collectors.toList());
-
-                                    for (Pair<String, ? extends Serializable> param : paginationParams) {
-                                        pageSpec = pageSpec.bind(param.getFirst(), param.getSecond());
-                                    }
-                                    return Tuples.of(baseSpec.fetch(), pageSpec.fetch());
-                                })
-                )
-                .flatMap(tuple -> {
-                    Mono<List<RequestDto>> result = tuple.getT1()
-                            .all()
-                            .map(this::fromFetchSpecToDto)
-                            .collectList();
-
-                    Mono<Long> cnt = tuple.getT2()
-                            .one()
-                            .map(map -> (Long) map.get("cnt"));
-
-                    return result.map(l -> getRequestDtoPageResponse(filter, l))
-                            .zipWith(cnt, PageResponse::setTotal);
-                });
+    private Mono<Long> getCount(RequestFilter filter) {
+        return Mono.just(getSql("select count(1) as cnt", filter))
+                .flatMap(sb -> generateSqlAndApplyBindings(sb, filter))
+                .map(DatabaseClient.GenericExecuteSpec::fetch)
+                .flatMap(FetchSpec::one)
+                .map(map -> (Long) map.get("cnt"));
     }
 
     private static PageResponse<RequestDto> getRequestDtoPageResponse(RequestFilter filter, List<RequestDto> l) {
